@@ -13,8 +13,8 @@ app = Flask(__name__)
 
 
 def ask_gemini(prompt, image_path=None):
-  # Используем стабильную версию v1 и проверенную модель gemini-1.5-flash
-  url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+  # Используем актуальную модель gemini-3.8-flash, которую требует Google
+  url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
   headers = {"Content-Type": "application/json"}
 
   parts = [{"text": prompt}]
