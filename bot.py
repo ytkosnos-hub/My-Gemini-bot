@@ -2,22 +2,40 @@ import os
 import telebot
 from PIL import Image
 import google.generativeai as genai
+from flask import Flask, request
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-flash")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+app = Flask(__name__)
+
+
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+  if request.headers.get("content-type") == "application/json":
+    json_string = request.get_data().decode("utf-8")
+    update = telebot.types.Update.de_json(json_string)
+    bot.process_new_updates([update])
+    return "", 200
+  else:
+    return "Forbidden", 403
+
+
+@app.route("/")
+def index():
+  return "Bot is running perfectly!", 200
 
 
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
   bot.reply_to(
       message,
-      "Здарова! Я твой личный Gemini. Напиши мне что-нибудь или отправь"
-      " картинку :)",
+      "Здарова! Я твой личный Gemini. Напиши мне текст или отправь картинку :)",
   )
 
 
@@ -54,4 +72,9 @@ def handle_photo(message):
 
 
 if __name__ == "__main__":
-  bot.infinity_polling()
+  bot.remove_webhook()
+  if RENDER_EXTERNAL_URL:
+    bot.set_webhook(url=f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN}")
+
+  port = int(os.getenv("PORT", 10000))
+  app.run(host="0.0.0.0", port=port)
