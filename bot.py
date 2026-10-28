@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 
 def ask_gemini(prompt, image_path=None):
-  url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+  url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
   headers = {"Content-Type": "application/json"}
 
   parts = [{"text": prompt}]
@@ -32,7 +32,15 @@ def ask_gemini(prompt, image_path=None):
   try:
     response = requests.post(url, headers=headers, json=data, timeout=30)
     res_json = response.json()
-    return res_json["candidates"][0]["content"]["parts"][0]["text"]
+
+    # Проверяем, есть ли кандидата в ответе
+    if "candidates" in res_json and len(res_json["candidates"]) > 0:
+      candidate = res_json["candidates"][0]
+      if "content" in candidate and "parts" in candidate["content"]:
+        return candidate["content"]["parts"][0]["text"]
+
+    # Если ответ странный, возвращаем его целиком для отладки
+    return f"Странный ответ от Google: {res_json}"
   except Exception as e:
     return f"Ошибка API: {e}"
 
