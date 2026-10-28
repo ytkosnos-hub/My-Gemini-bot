@@ -92,4 +92,7 @@ def handle_photo(message):
 if __name__ == "__main__":
   bot.remove_webhook()
   if RENDER_EXTERNAL_URL:
-    bot.set_webhook(url=f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN
+    bot.set_webhook(url=f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN}")
+
+  port = int(os.getenv("PORT", 10000))
+  app.run(host="0.0.0.0", port=port)
