@@ -8,6 +8,7 @@ import html
 import time
 import base64
 import threading
+from collections import deque
 import requests
 import telebot
 from urllib.parse import quote
@@ -33,6 +34,7 @@ RENDER_EXTERNAL_URL = env("RENDER_EXTERNAL_URL")
 # ============ МОДЕЛИ ============
 FAST_MODELS = [env("FAST_MODEL") or "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.6-flash"]
 DEEP_GEMINI = env("DEEP_MODEL") or "gemini-3.5-flash"
+PHOTO_MODELS = [env("PHOTO_MODEL") or "gemini-3.6-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
 
 # (название, провайдер, модель)
 CEREBRAS_GPT = ("Cerebras gpt-oss-120b", "cerebras", "gpt-oss-120b")
@@ -56,10 +58,15 @@ PROVIDERS = {
 HIGH_MEMBERS = [OR_ULTRA, CF_KIMI, CF_GLM, CEREBRAS_GPT, GROQ_COMPOUND]
 
 SYSTEM_PROMPT = (
-    "Отвечай на русском, кратко и по делу. Пиши для Telegram: без LaTeX и знаков $, "
-    "формулы только обычным текстом с символами Unicode (x², √, ×, ·, °, ≤, π). "
-    "Без таблиц. Заголовки и важное выделяй **жирным**, списки делай через «•» или цифры."
+    "Тебя зовут Mewyto, ты ИИ-ассистент. Отвечай на русском, по делу, одним конкретным ответом "
+    "без вариантов «или» и лишних оговорок. Если просят решить задание, решай его полностью: все пункты "
+    "и подпункты по порядку, с краткими шагами и ответом. Если дано фото с заданием, сразу решай его, "
+    "а не описывай фото. Пиши для Telegram: без LaTeX и знаков $, формулы обычным текстом с Unicode "
+    "(x², √, ×, ·, °, ≤, π). Без таблиц. Важное выделяй **жирным**, списки делай через «•» или цифры. "
+    "Химия: индексы нижние (H₂SO₄), заряды ионов верхние (Na⁺, SO₄²⁻), коэффициенты обычными цифрами "
+    "(2NaOH + H₂SO₄ → Na₂SO₄ + 2H₂O), осадок ↓, газ ↑."
 )
+ERR_TEXT = "Не получилось ответить. Попробуй ещё раз через минуту."
 
 MAX_HISTORY = 30
 RESET_BUTTON = "🔄 Сбросить контекст"
@@ -67,6 +74,9 @@ MODE_BUTTONS = {"⚡ Обычный": "normal", "🧠 Высокий": "high"}
 MODE_NAMES = {"normal": "⚡ Обычный", "high": "🧠 Высокий"}
 IMG_BUTTON = "🎨 Картинка"
 SEARCH_BUTTON = "🔎 Поиск"
+PROMPT_BUTTON = "📝 Промты"
+custom_prompts = {}   # чат -> инструкция пользователя («промт»)
+seen_updates = deque(maxlen=300)
 pending = {}   # чат -> "img" / "search": что ждём от пользователя следующим сообщением
 # адрес вебхука не содержит токен, чтобы он не светился в логах
 WEBHOOK_PATH = hashlib.sha256((TELEGRAM_TOKEN or "").encode()).hexdigest()[:40]
@@ -139,6 +149,31 @@ def convert_math(t):
     return t
 
 
+ELEMENTS = set("H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr".split())
+SINGLE_OK = {"H2", "O2", "O3", "N2", "F2", "Cl2", "Br2", "I2", "P4", "S8"}
+SUB_DIGITS = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
+SUP_CHARGE = str.maketrans("0123456789+-", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻")
+CHEM_RE = re.compile(r"(?<![A-Za-z\d])(\d*)((?:[A-Z][a-z]?\d{0,2}|\((?:[A-Z][a-z]?\d{0,2})+\)\d{0,2})+)(?![A-Za-z\d])")
+
+
+def chem_format(text):
+    """H2SO4 -> H₂SO₄, Na(+) -> Na⁺, SO4(2-) -> SO₄²⁻. Коэффициенты (2NaOH) остаются обычными."""
+    def formula(m):
+        coef, f = m.group(1), m.group(2)
+        if not re.search(r"\d", f):
+            return m.group(0)
+        if not all(sym in ELEMENTS for sym in re.findall(r"[A-Z][a-z]?", f)):
+            return m.group(0)
+        if len(re.findall(r"[A-Z]", f)) == 1 and "(" not in f and f not in SINGLE_OK:
+            return m.group(0)
+        return coef + f.translate(SUB_DIGITS)
+
+    text = CHEM_RE.sub(formula, text)
+    text = re.sub(r"(?<=[A-Za-z₀-₉\)])\((\d?[+-])\)", lambda m: m.group(1).translate(SUP_CHARGE), text)
+    text = re.sub(r"(?<=[A-Za-z₀-₉\)])\^\{?(\d?[+-])\}?", lambda m: m.group(1).translate(SUP_CHARGE), text)
+    return text
+
+
 def to_tg_html(text):
     store = []
 
@@ -149,7 +184,7 @@ def to_tg_html(text):
     text = re.sub(r"```[a-zA-Z0-9_+-]*\n?(.*?)```",
                   lambda m: keep("<pre>" + html.escape(m.group(1).strip("\n")) + "</pre>"), text, flags=re.S)
     text = re.sub(r"`([^`\n]+)`", lambda m: keep("<code>" + html.escape(m.group(1)) + "</code>"), text)
-    text = convert_math(text)
+    text = chem_format(convert_math(text))
 
     # таблицы -> моноширинный блок
     out, rows = [], []
@@ -219,7 +254,7 @@ def main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(*[types.KeyboardButton(t) for t in MODE_BUTTONS])
     kb.row(types.KeyboardButton(IMG_BUTTON), types.KeyboardButton(SEARCH_BUTTON))
-    kb.row(types.KeyboardButton(RESET_BUTTON))
+    kb.row(types.KeyboardButton(PROMPT_BUTTON), types.KeyboardButton(RESET_BUTTON))
     return kb
 
 
@@ -247,12 +282,14 @@ def save_turn(chat_id, user_text, answer):
 
 # ============ ВЫЗОВЫ НЕЙРОСЕТЕЙ ============
 
-def call_gemini(model, contents, timeout=25, system=True):
+def call_gemini(model, contents, timeout=25, system=True, tools=None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
     body = {"contents": contents}
     if system:
-        body["systemInstruction"] = {"parts": [{"text": SYSTEM_PROMPT}]}
+        body["systemInstruction"] = {"parts": [{"text": system if isinstance(system, str) else SYSTEM_PROMPT}]}
+    if tools:
+        body["tools"] = tools
     try:
         res = requests.post(url, headers=headers, json=body, timeout=timeout).json()
     except Exception as e:
@@ -317,8 +354,8 @@ def gemini_contents(history, parts):
     return contents
 
 
-def openai_messages(history, question):
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+def openai_messages(history, question, sysmsg=None):
+    msgs = [{"role": "system", "content": sysmsg or SYSTEM_PROMPT}]
     msgs += [{"role": h["role"], "content": h["text"]} for h in history]
     msgs.append({"role": "user", "content": question})
     return msgs
@@ -353,30 +390,39 @@ def race(tasks, timeout):
     return False, "", ""
 
 
-def run_normal(history, question, image=None):
-    """Обычный режим: Gemini и быстрые Cerebras/Groq отвечают наперегонки, берём первый ответ."""
-    contents = gemini_contents(history, user_parts(question, image))
-    tasks = [lambda: gemini_chain(FAST_MODELS[:2], contents, budget=40, per_call=20)]
-    if not image:
-        msgs = openai_messages(history, question)
-        for spec in (CEREBRAS_GPT, GROQ_GPT):
-            if PROVIDERS[spec[1]][1]:
-                tasks.append(lambda s=spec: (*call_openai_style(s, msgs, 40), s[0]))
+def sysmsg_for(chat_id):
+    with lock:
+        extra = custom_prompts.get(chat_id)
+    return SYSTEM_PROMPT + (f"\n\nИнструкция пользователя, выполняй её всегда: {extra}" if extra else "")
+
+
+def run_normal(history, question, image=None, sysmsg=None):
+    """Обычный режим: Gemini и быстрые Cerebras/Groq отвечают наперегонки, берётся первый ответ."""
+    sysmsg = sysmsg or SYSTEM_PROMPT
+    if image:
+        contents = gemini_contents(history, user_parts(question, image))
+        ok, text, _ = gemini_chain(PHOTO_MODELS, contents, budget=55, per_call=35, system=sysmsg)
+        return ok, (text if ok else ""), ""
+    contents = gemini_contents(history, user_parts(question, None))
+    tasks = [lambda: gemini_chain(FAST_MODELS[:2], contents, budget=40, per_call=20, system=sysmsg)]
+    msgs = openai_messages(history, question, sysmsg)
+    for spec in (CEREBRAS_GPT, GROQ_GPT):
+        if PROVIDERS[spec[1]][1]:
+            tasks.append(lambda s=spec: (*call_openai_style(s, msgs, 40), s[0]))
     ok, text, _ = race(tasks, 45)
-    if ok:
-        return True, text, ""
-    return False, "Ни одна модель не ответила вовремя. Попробуй ещё раз.", ""
+    return (True, text, "") if ok else (False, "", "")
 
 
-def run_high(history, question, image=None):
+def run_high(history, question, image=None, sysmsg=None):
     """Высокий режим: совет сильных моделей + судья, до ~3 минут."""
+    sysmsg = sysmsg or SYSTEM_PROMPT
     t0 = time.time()
     if image:
         contents = gemini_contents(history, user_parts(question, image))
-        ok, text, used = gemini_chain([DEEP_GEMINI] + FAST_MODELS, contents, budget=120, per_call=60)
-        return ok, text, (f"🧠 {used}" if ok else "")
+        ok, text, _ = gemini_chain([DEEP_GEMINI] + PHOTO_MODELS, contents, budget=150, per_call=70, system=sysmsg)
+        return ok, (text if ok else ""), ""
 
-    msgs = openai_messages(history, question)
+    msgs = openai_messages(history, question, sysmsg)
     members = [s for s in HIGH_MEMBERS if PROVIDERS[s[1]][1]]
     answers = {}
     if members:
@@ -396,16 +442,14 @@ def run_high(history, question, image=None):
                 break
             if len(answers) >= 2:
                 second = second or time.time()
-                if time.time() - second > 12:   # не ждём самых медленных
+                if time.time() - second > 12:
                     break
         pool.shutdown(wait=False)
 
     if not answers:
-        ok, text, _ = run_normal(history, question)
-        return ok, text, ("⚡ Высокий режим сейчас недоступен, ответил обычный" if ok else "")
+        return run_normal(history, question, None, sysmsg)
     if len(answers) == 1:
-        label, text = next(iter(answers.items()))
-        return True, text, f"🧠 Ответила только: {label}"
+        return True, next(iter(answers.values())), ""
 
     joined = "\n\n".join(f"=== Ответ {i} ===\n{t[:5000]}" for i, t in enumerate(answers.values(), 1))
     prompt = (
@@ -414,43 +458,73 @@ def run_high(history, question, image=None):
         "(на языке вопроса). Не упоминай нейросети и свой процесс, только сам ответ.\n\n"
         f"ВОПРОС:\n{question}\n\n{joined}"
     )
-    footer = f"🧠 Совет ({len(answers)}): " + ", ".join(answers)
 
     def left():
         return max(10, 170 - (time.time() - t0))
 
-    ok, text, _ = gemini_chain([DEEP_GEMINI], [{"role": "user", "parts": [{"text": prompt}]}], budget=left(), per_call=min(60, left()))
+    ok, text, _ = gemini_chain([DEEP_GEMINI], [{"role": "user", "parts": [{"text": prompt}]}], budget=left(), per_call=min(60, left()), system=sysmsg)
     if ok:
-        return True, text, footer + " → судья Gemini 3.5"
+        return True, text, ""
     for spec in (CEREBRAS_GPT, GROQ_GPT):
-        ok, text = call_openai_style(spec, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}], min(50, left()))
+        ok, text = call_openai_style(spec, [{"role": "system", "content": sysmsg}, {"role": "user", "content": prompt}], min(50, left()))
         if ok:
-            return True, text, footer + f" → судья {spec[0]}"
-    label, text = next(iter(answers.items()))
-    return True, text, f"🧠 Судья недоступен, ответ: {label}"
+            return True, text, ""
+    return True, next(iter(answers.values())), ""
 
 
 RUNNERS = {"normal": run_normal, "high": run_high}
 
 
-def process_question(message, question, image=None):
+def process_question(message, question):
     chat_id = message.chat.id
     mode = get_mode(chat_id)
     bot.send_chat_action(chat_id, "typing")
     wait_msg = None
-    if mode == "high" and not image:
+    if mode == "high":
         wait_msg = bot.send_message(chat_id, "🧠 Высокий режим: думаю, до 3 минут…")
-    ok, text, footer = RUNNERS[mode](get_history(chat_id), question, image)
+    ok, text, _ = RUNNERS[mode](get_history(chat_id), question, None, sysmsg_for(chat_id))
     if wait_msg:
         try:
             bot.delete_message(chat_id, wait_msg.message_id)
         except Exception:
             pass
     if ok:
-        save_turn(chat_id, question if not image else f"[Я отправил фото] {question}", text)
-        send_answer(message, text, footer)
+        save_turn(chat_id, question, text)
+        send_answer(message, text)
     else:
-        bot.reply_to(message, text[:1500], reply_markup=main_keyboard())
+        bot.reply_to(message, ERR_TEXT, reply_markup=main_keyboard())
+
+
+def process_photo(message, img, caption):
+    """Фото: сразу решаем задание; если в задании нужен график, присылаем и его."""
+    chat_id = message.chat.id
+    mode = get_mode(chat_id)
+    task = caption or "Реши все задания на фото полностью, по порядку. Не описывай фото."
+    bot.send_chat_action(chat_id, "typing")
+    pool = ThreadPoolExecutor(max_workers=2)
+    f_sol = pool.submit(RUNNERS[mode], get_history(chat_id), task, img, sysmsg_for(chat_id))
+    f_gr = pool.submit(graph_from_image, img, caption)
+    try:
+        ok, text, _ = f_sol.result(timeout=170)
+    except Exception as e:
+        print("PHOTO SOLVE ERROR", e, flush=True)
+        ok, text = False, ""
+    try:
+        spec = f_gr.result(timeout=25)
+    except Exception:
+        spec = None
+    pool.shutdown(wait=False)
+    if ok:
+        save_turn(chat_id, f"[Я отправил фото] {task}", text)
+        send_answer(message, text)
+    else:
+        bot.reply_to(message, ERR_TEXT, reply_markup=main_keyboard())
+    if spec:
+        try:
+            bot.send_photo(chat_id, make_plot(spec), caption=str(spec.get("caption") or "")[:900] or None,
+                           reply_markup=main_keyboard())
+        except Exception as e:
+            print("PHOTO GRAPH ERROR", e, flush=True)
 
 
 # ============ КАРТИНКИ ============
@@ -506,17 +580,20 @@ def do_image(message, text):
     if img:
         bot.send_photo(chat_id, img, reply_to_message_id=message.message_id, reply_markup=main_keyboard())
     else:
-        bot.reply_to(message, "Не получилось нарисовать. Проверь в Render токен и Account ID Cloudflare (смотри Logs).", reply_markup=main_keyboard())
+        bot.reply_to(message, "Не получилось нарисовать. Попробуй описать иначе или повторить чуть позже.", reply_markup=main_keyboard())
 
 
 # ============ ГРАФИКИ ============
 
 GRAPH_RE = re.compile(
     r"((?:постро\w*|нарису\w*|начерти\w*|изобрази\w*|покаж\w*|сделай|дай|выведи)\W+(?:\w+\W+){0,4}?"
-    r"(?:график|диаграмм|парабол|гипербол|синусоид|окружност)"
+    r"(?:график|диаграмм|парабол|гипербол|синусоид|косинусоид|окружност)"
     r"|график\w*[^\n]{0,30}(?:y\s*=|f\s*\(\s*x))",
     re.I,
 )
+# мягкая проверка: когда пользователь нажал «Картинка», но просит что-то математическое
+MATH_RE = re.compile(r"(график|парабол|гипербол|синусоид|косинусоид|окружност|функци|\by\s*=|\bf\s*\(\s*x|x\s*(?:\^|\*\*)\s*\d)", re.I)
+SOLVE_RE = re.compile(r"(реши|решить|найди|найти|вычисли|определи|докажи|исследуй|разбери|объясни)", re.I)
 
 
 def safe_eval(expr, variables):
@@ -631,53 +708,79 @@ def make_plot(spec):
     return buf.getvalue()
 
 
+GRAPH_JSON_HELP = (
+    '{"title":"...","x_min":-10,"x_max":10,"y_min":null,"y_max":null,'
+    '"series":[{"type":"func","expr":"x**2-4","label":"y = x² − 4"},'
+    '{"type":"implicit","expr":"x**2+y**2=9","label":"x² + y² = 9"},'
+    '{"type":"points","x":[1,2,3],"y":[2,4,3],"label":"данные"}],'
+    '"caption":"1-2 предложения на русском: что изображено, ключевые точки"}\n'
+    "Правила: в expr только x (и y для implicit), операции + - * / **, умножение всегда знаком *, "
+    "функции sin cos tan asin acos atan exp log sqrt abs, константы pi e. "
+    "Выбери x_min и x_max так, чтобы было видно главное. Используй нужные типы серий, лишние не добавляй."
+)
+
+
+def parse_spec(raw):
+    m = re.search(r"\{.*\}", raw or "", re.S)
+    return json.loads(m.group(0)) if m else None
+
+
 def do_graph(message, text):
     """Строит график по запросу. Возвращает True, если график отправлен."""
     chat_id = message.chat.id
     bot.send_chat_action(chat_id, "upload_photo")
-    prompt = (
-        "Пользователь просит построить график. Верни ТОЛЬКО JSON без пояснений и без ```:\n"
-        '{"title":"...","x_min":-10,"x_max":10,"y_min":null,"y_max":null,'
-        '"series":[{"type":"func","expr":"x**2-4","label":"y = x² − 4"},'
-        '{"type":"implicit","expr":"x**2+y**2=9","label":"x² + y² = 9"},'
-        '{"type":"points","x":[1,2,3],"y":[2,4,3],"label":"данные"}],'
-        '"caption":"1-2 предложения на русском: что изображено, ключевые точки"}\n'
-        "Правила: в expr только x (и y для implicit), операции + - * / **, умножение всегда знаком *, "
-        "функции sin cos tan asin acos atan exp log sqrt abs, константы pi e. "
-        "Выбери x_min и x_max так, чтобы было видно главное. Используй нужные типы серий, лишние не добавляй.\n"
-        f"Запрос: {text}"
-    )
+    prompt = "Пользователь просит построить график. Верни ТОЛЬКО JSON без пояснений и без ```:\n" + GRAPH_JSON_HELP + f"\nЗапрос: {text}"
     ok, raw, _ = gemini_chain(FAST_MODELS[:2], [{"role": "user", "parts": [{"text": prompt}]}], budget=35, per_call=20, system=False)
     if not ok:
         return False
     try:
-        spec = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
+        spec = parse_spec(raw)
         png = make_plot(spec)
-    except ImportError:
-        bot.reply_to(message, "Для графиков добавь строки numpy и matplotlib в requirements.txt на GitHub.", reply_markup=main_keyboard())
-        return True
     except Exception as e:
-        print("GRAPH ERROR", e, flush=True)
+        print("GRAPH ERROR", repr(e), flush=True)
         return False
     bot.send_photo(chat_id, png, caption=str(spec.get("caption") or "")[:900] or None,
                    reply_to_message_id=message.message_id, reply_markup=main_keyboard())
     return True
 
 
+def graph_from_image(img, caption):
+    """Если в задании на фото нужно построить график, возвращает его описание, иначе None."""
+    prompt = (
+        "Посмотри на задание. Если в нём требуется построить или нарисовать график функции, параболу, гиперболу и т.п., "
+        "верни ТОЛЬКО JSON для первого такого задания (без пояснений и без ```), формат:\n" + GRAPH_JSON_HELP +
+        "\nЕсли построение графика не требуется, верни ровно слово NONE."
+        + (f"\nПодпись пользователя: {caption}" if caption else "")
+    )
+    ok, raw, _ = gemini_chain(FAST_MODELS[:2], [{"role": "user", "parts": user_parts(prompt, img)}], budget=40, per_call=25, system=False)
+    if not ok or not re.search(r"\{", raw) or raw.strip().upper().startswith("NONE"):
+        return None
+    try:
+        spec = parse_spec(raw)
+        make_plot(spec)   # проверяем заранее, что график строится
+        return spec
+    except Exception as e:
+        print("GRAPH FROM IMAGE ERROR", repr(e), flush=True)
+        return None
+
+
 # ============ ПОИСК ============
 
 def do_search(message, question):
-    if not GROQ_KEY:
-        bot.reply_to(message, "Для поиска нужен ключ GROQ_API_KEY в Render -> Environment.")
-        return
     chat_id = message.chat.id
     bot.send_chat_action(chat_id, "typing")
-    ok, text = call_openai_style(GROQ_COMPOUND, openai_messages(get_history(chat_id), question), 60)
+    sysmsg, hist = sysmsg_for(chat_id), get_history(chat_id)
+    ok, text = False, ""
+    if GROQ_KEY:
+        ok, text = call_openai_style(GROQ_COMPOUND, openai_messages(hist, question, sysmsg), 60)
+    if not ok:
+        ok, text, _ = call_gemini(FAST_MODELS[0], gemini_contents(hist, [{"text": question}]), 40, sysmsg,
+                                  tools=[{"google_search": {}}])
     if ok:
         save_turn(chat_id, question, text)
-        send_answer(message, text, "🔎 Groq Compound")
+        send_answer(message, text)
     else:
-        bot.reply_to(message, f"Поиск не сработал: {text[:300]}")
+        bot.reply_to(message, "Поиск сейчас недоступен. Попробуй чуть позже.", reply_markup=main_keyboard())
 
 
 # ============ TELEGRAM ============
@@ -686,6 +789,9 @@ def do_search(message, question):
 def webhook():
     if flask_request.headers.get("content-type") == "application/json":
         update = telebot.types.Update.de_json(flask_request.get_data().decode("utf-8"))
+        if update.update_id in seen_updates:   # Telegram иногда присылает одно и то же дважды
+            return "", 200
+        seen_updates.append(update.update_id)
         threading.Thread(target=bot.process_new_updates, args=([update],), daemon=True).start()
         return "", 200
     return "Forbidden", 403
@@ -700,11 +806,12 @@ def index():
 def send_welcome(message):
     bot.reply_to(
         message,
-        "Здарова! Я помню наш разговор. Кнопки внизу:\n\n"
+        "Привет! Я Mewyto, твой ИИ-ассистент. Я помню наш разговор.\n\n"
         "⚡ Обычный: быстрый ответ, до 1 минуты\n"
         "🧠 Высокий: несколько сильных нейросетей думают вместе, до 3 минут\n"
-        "🎨 Картинка и 🔎 Поиск: нажми и напиши, что нужно\n\n"
-        "Рисую и без кнопок: просто напиши «нарисуй …» или «построй график …».",
+        "🎨 Картинка, 🔎 Поиск: нажми и напиши, что нужно\n"
+        "📝 Промты: задай мне свои правила, и я буду им следовать\n\n"
+        "Пришли фото с заданием, и я сразу его решу. Могу построить график: «построй параболу y=x²−4».",
         reply_markup=main_keyboard(),
     )
 
@@ -741,6 +848,33 @@ def search_button(message):
     bot.reply_to(message, "Напиши, что найти в интернете. Например: курс доллара сегодня", reply_markup=main_keyboard())
 
 
+@bot.message_handler(func=lambda m: m.text == PROMPT_BUTTON, content_types=["text"])
+def prompt_button(message):
+    with lock:
+        pending[message.chat.id] = "prompt"
+        current = custom_prompts.get(message.chat.id)
+    bot.reply_to(
+        message,
+        "📝 Напиши инструкцию, и я буду следовать ей во всех ответах. Например:\n"
+        "• «Отвечай коротко, как для 5 класса»\n• «Ты репетитор по химии, объясняй по шагам»\n\n"
+        + (f"Сейчас стоит: {current}\n\n" if current else "Сейчас инструкции нет.\n\n")
+        + "Чтобы удалить её, напиши «удалить».",
+        reply_markup=main_keyboard(),
+    )
+
+
+def save_prompt(message, text):
+    chat_id = message.chat.id
+    if text.strip().lower() in ("удалить", "сбросить", "очистить", "нет"):
+        with lock:
+            custom_prompts.pop(chat_id, None)
+        bot.reply_to(message, "Готово, инструкция удалена.", reply_markup=main_keyboard())
+    else:
+        with lock:
+            custom_prompts[chat_id] = text.strip()[:1500]
+        bot.reply_to(message, "Принято, буду следовать этой инструкции.", reply_markup=main_keyboard())
+
+
 @bot.message_handler(commands=["search"])
 def cmd_search(message):
     q = message.text.partition(" ")[2].strip()
@@ -764,16 +898,21 @@ def handle_text(message):
     text = message.text
     with lock:
         wait_for = pending.pop(message.chat.id, None)
+    if wait_for == "prompt":
+        return save_prompt(message, text)
+    if wait_for == "search":
+        return do_search(message, text)
     if wait_for == "img":
-        do_image(message, text)
-    elif wait_for == "search":
-        do_search(message, text)
-    elif GRAPH_RE.search(text) and do_graph(message, text):
-        pass
-    elif DRAW_RE.search(text):
-        do_image(message, text)
-    else:
-        process_question(message, text)
+        if MATH_RE.search(text) and do_graph(message, text):
+            return
+        return do_image(message, text)
+    is_graph = bool(GRAPH_RE.search(text))
+    graph_done = is_graph and do_graph(message, text)
+    if graph_done and not SOLVE_RE.search(text):
+        return
+    if not is_graph and DRAW_RE.search(text):
+        return do_image(message, text)
+    process_question(message, text)
 
 
 @bot.message_handler(content_types=["photo"])
@@ -781,10 +920,10 @@ def handle_photo(message):
     try:
         info = bot.get_file(message.photo[-1].file_id)
         img = bot.download_file(info.file_path)
-        process_question(message, message.caption or "Опиши что на фото и ответь на русском", img)
+        process_photo(message, img, message.caption)
     except Exception as e:
-        print("PHOTO ERROR", e, flush=True)
-        bot.reply_to(message, f"Ошибка обработки фото: {e}")
+        print("PHOTO ERROR", repr(e), flush=True)
+        bot.reply_to(message, ERR_TEXT, reply_markup=main_keyboard())
 
 
 # ============ ЗАПУСК ============
