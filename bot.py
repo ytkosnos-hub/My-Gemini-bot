@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Mewyto AI — Telegram-бот (Flask + webhook).
+Muwyto AI — Telegram-бот (Flask + webhook).
 
 Разделы (единственные кнопки верхнего уровня):
   📚 Учёба — контекст (со счётчиком), свой промт, режимы Обычный/Высокий.
-             Понимает фото (решает задания), умеет сама присылать график
-             функции и таблицу картинкой, если это уместно по ответу.
-             Если ответ длиннее лимита Telegram — уходит PDF-файлом.
+             Обычный — один быстрый вызов Gemini.
+             Высокий — "совет ИИ": параллельно спрашиваем Gemini, OpenRouter
+             и Cloudflare Workers AI (какие ключи есть), а Gemini-"судья"
+             собирает из черновиков один лучший ответ.
+             Понимает фото (решает задания), сама шлёт график функции и
+             таблицу картинкой, если это уместно. Если ответ не влезает
+             в лимит Telegram — уходит PDF-файлом. Если модель обрезалась
+             на полуслове — бот сам доспрашивает "продолжи" и склеивает.
   🏠 Быт   — пока пустой, заглушка под будущие функции.
 """
 
 import base64
+import concurrent.futures
 import os
 import re
 import threading
@@ -34,8 +40,6 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 # ──────────────────────────── Ключи — только из Render → Environment ────────────────────────────
-# В коде ключей нет. TELEGRAM_TOKEN обязателен; ключей Gemini можно сколько угодно:
-# GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3, ... — бот сам их все найдёт.
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 
@@ -58,16 +62,45 @@ GEMINI_API_KEYS = _collect_gemini_keys()
 if not GEMINI_API_KEYS:
     raise RuntimeError("Задай GEMINI_API_KEY (и при желании GEMINI_API_KEY_2, _3, ...) в Render → Environment")
 
-# Модель для обычного режима (дешёвая и быстрая) и для высокого (самая умная,
-# с автоматическим откатом на более простую, если у конкретного ключа нет к ней доступа).
+
+def _collect_openrouter_keys() -> list[str]:
+    keys = []
+    if os.environ.get("OPENROUTER_API_KEY"):
+        keys.append(os.environ["OPENROUTER_API_KEY"])
+    i = 2
+    while True:
+        val = os.environ.get(f"OPENROUTER_API_KEY_{i}")
+        if not val:
+            break
+        keys.append(val)
+        i += 1
+    return keys
+
+
+OPENROUTER_API_KEYS = _collect_openrouter_keys()
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+
+# Модели для обычного/высокого режима (Gemini) — высокая с автооткатом, если ключу она недоступна
 NORMAL_MODEL = os.environ.get("NORMAL_MODEL", "gemini-3.5-flash-lite")
 HIGH_MODEL = os.environ.get("HIGH_MODEL", "gemini-3.1-pro-preview")
 HIGH_MODEL_FALLBACK = os.environ.get("HIGH_MODEL_FALLBACK", "gemini-3.5-flash")
 
+# Остальные "голоса" совета для Высокого режима (бесплатные модели, на октябрь 2026)
+OPENROUTER_MODELS = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "openai/gpt-oss-120b:free",
+]
+CLOUDFLARE_MODELS = ["@cf/meta/llama-3.3-70b-instruct-fp8-fast"]
+
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "mewyto-hook")
 
-# ──────────────────────────── Экономия токенов ────────────────────────────
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "2048"))
+# ──────────────────────────── Лимиты и экономия токенов ────────────────────────────
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "4096"))   # на финальный ответ
+COUNCIL_MAX_TOKENS = int(os.environ.get("COUNCIL_MAX_TOKENS", "1200"))  # на черновик каждого голоса совета
+COUNCIL_TIMEOUT = int(os.environ.get("COUNCIL_TIMEOUT", "45"))  # сек, сколько ждём голоса совета
+CONTINUATION_LIMIT = int(os.environ.get("CONTINUATION_LIMIT", "6"))  # сколько раз доспрашивать "продолжи"
+MAX_ANSWER_CHARS = int(os.environ.get("MAX_ANSWER_CHARS", "60000"))  # потолок длины склеенного ответа
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))  # сообщений (user+model) в памяти на пользователя
 
 TELEGRAM_MAX_MESSAGE = 4096
@@ -76,6 +109,9 @@ CURRENT_DATE = datetime.now().strftime("%d.%m.%Y")
 SYSTEM_PROMPT_BASE = (
     f"Ты — Mewyto AI, точный помощник. Сегодня {CURRENT_DATE}. "
     "Никогда не выдумывай цифры и факты — если не уверен, так и скажи. "
+    "Не думай про лимит длины одного сообщения в Telegram и не предупреждай о нём — "
+    "об этом заботится сама программа. Пиши ответ настолько длинным и полным, насколько просит пользователь "
+    "(например, если просят пересказ на N страниц — пиши весь текст полностью, не сокращай и не останавливайся раньше). "
     "Форматирование: обычный текст, важные слова и заголовки выделяй **жирным** (двойными звёздочками), "
     "никаких решёток # и прочей сложной Markdown-разметки. "
     "Математику и химию пиши понятными юникод-символами, а не текстом и не значком ^: "
@@ -96,7 +132,6 @@ _key_index = 0
 _key_lock = threading.Lock()
 pro_incapable_keys: set[str] = set()  # ключи, которым недоступна HIGH_MODEL — узнаём сами на лету
 
-# Память в оперативке — пропадает при перезапуске Render
 user_modes: dict[int, str] = {}       # "normal" | "advanced"
 user_sections: dict[int, str] = {}    # "study" | "home" | None
 user_prompts: dict[int, str] = {}     # свой промт пользователя
@@ -104,8 +139,6 @@ gemini_history: dict[int, list] = {}  # история диалога для Gem
 
 
 # ──────────────────────────── Шрифт для PDF/картинок (кириллица) ────────────────────────────
-# Берём шрифт из пакета matplotlib — он уже содержит DejaVuSans с кириллицей,
-# так что ничего не надо качать из интернета при старте (раньше скачивание иногда не срабатывало).
 
 FONT_NAME = "Helvetica"
 FONT_BOLD_NAME = "Helvetica-Bold"
@@ -123,7 +156,7 @@ except Exception as e:
 def make_pdf(text: str, title: str = "Ответ Mewyto AI") -> bytes:
     import textwrap
 
-    plain = text.replace("**", "")  # в PDF жирный не рисуем, просто убираем маркеры
+    plain = text.replace("**", "")
 
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
@@ -244,7 +277,7 @@ def to_telegram_html(text: str) -> str:
     return "".join(f"<b>{p}</b>" if i % 2 == 1 else p for i, p in enumerate(parts))
 
 
-# ──────────────────────────── Gemini ────────────────────────────
+# ──────────────────────────── Gemini (с докруткой при обрезании) ────────────────────────────
 
 def remember(uid: int, user_text: str, answer: str) -> None:
     g = gemini_history.setdefault(uid, [])
@@ -253,54 +286,187 @@ def remember(uid: int, user_text: str, answer: str) -> None:
     del g[:-MAX_HISTORY]
 
 
-def _call_gemini(model: str, key: str, sys_prompt: str, contents: list):
+def _call_gemini(model: str, key: str, sys_prompt: str, contents: list, max_tokens: int | None = None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {
         "system_instruction": {"parts": [{"text": sys_prompt}]},
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS},
+        "generationConfig": {"maxOutputTokens": max_tokens or MAX_OUTPUT_TOKENS},
     }
     return requests.post(url, json=payload, headers={"x-goog-api-key": key}, timeout=90)
 
 
-def _try_key(key: str, models: list[str], sys_prompt: str, contents: list):
-    last = ""
-    for model in models:
+def _generate_with_continuation(model: str, key: str, sys_prompt: str, contents: list):
+    """Возвращает (http_код, собранный_текст, текст_ошибки). При обрезании MAX_TOKENS сама доспрашивает."""
+    full_text = ""
+    local_contents = list(contents)
+    for _ in range(CONTINUATION_LIMIT):
         try:
-            resp = _call_gemini(model, key, sys_prompt, contents)
+            resp = _call_gemini(model, key, sys_prompt, local_contents)
         except requests.RequestException as e:
-            last = str(e)
-            continue
+            return None, full_text, str(e)
 
-        if resp.status_code == 200:
+        if resp.status_code != 200:
+            return resp.status_code, full_text, resp.text[:200]
+
+        data = resp.json()
+        cands = data.get("candidates", [])
+        if not cands:
+            return 200, full_text, "Пустой ответ модели"
+
+        cand = cands[0]
+        piece = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
+        full_text += piece
+        finish = cand.get("finishReason", "")
+
+        if finish != "MAX_TOKENS" or len(full_text) > MAX_ANSWER_CHARS:
+            return 200, full_text, ""
+
+        local_contents = local_contents + [
+            {"role": "model", "parts": [{"text": piece}]},
+            {"role": "user", "parts": [{"text": "Продолжи ровно с места, где остановился. Не повторяйся и не здоровайся заново."}]},
+        ]
+
+    return 200, full_text, ""
+
+
+def gemini_generate(sys_prompt: str, contents: list, models: list[str]) -> str:
+    """Перебирает все ключи Gemini; для каждого — список моделей (первая из них — предпочтительная)."""
+    global _key_index
+    last_error = ""
+    for _ in range(len(GEMINI_API_KEYS)):
+        with _key_lock:
+            key = GEMINI_API_KEYS[_key_index]
+            _key_index = (_key_index + 1) % len(GEMINI_API_KEYS)
+
+        try_models = models
+        if len(models) > 1 and key in pro_incapable_keys:
+            try_models = models[1:]
+
+        for model in try_models:
+            status, text, err = _generate_with_continuation(model, key, sys_prompt, contents)
+
+            if status in (403, 404) and model == HIGH_MODEL:
+                pro_incapable_keys.add(key)
+                continue
+            if status in (429, 503):
+                last_error = err
+                continue
+            if status != 200:
+                last_error = err or f"код {status}"
+                continue
+            if text.strip():
+                return text
+            last_error = err or "пустой ответ"
+
+    raise RuntimeError(f"Не удалось получить ответ ни по одному ключу Gemini. {last_error[:300]}")
+
+
+def _gemini_oneshot(models: list[str], sys_prompt: str, text: str, max_tokens: int) -> str:
+    """Короткий одиночный вызов Gemini — используется как один из голосов совета (без докрутки)."""
+    global _key_index
+    contents = [{"role": "user", "parts": [{"text": text}]}]
+    for _ in range(len(GEMINI_API_KEYS)):
+        with _key_lock:
+            key = GEMINI_API_KEYS[_key_index]
+            _key_index = (_key_index + 1) % len(GEMINI_API_KEYS)
+        try_models = models[1:] if (len(models) > 1 and key in pro_incapable_keys) else models
+        for model in try_models:
+            try:
+                resp = _call_gemini(model, key, sys_prompt, contents, max_tokens)
+            except requests.RequestException:
+                continue
+            if resp.status_code in (403, 404) and model == HIGH_MODEL:
+                pro_incapable_keys.add(key)
+                continue
+            if resp.status_code != 200:
+                continue
             data = resp.json()
-            texts = [
-                p["text"]
-                for c in data.get("candidates", [])
-                for p in c.get("content", {}).get("parts", [])
-                if p.get("text")
-            ]
-            if texts:
-                return "OK", "".join(texts)
-            last = "Пустой ответ модели"
-            continue
+            cands = data.get("candidates", [])
+            if cands:
+                piece = "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", []))
+                if piece.strip():
+                    return piece
+    raise RuntimeError("Gemini не ответил")
 
-        if resp.status_code in (403, 404) and model == HIGH_MODEL:
-            pro_incapable_keys.add(key)  # этому ключу недоступна умная модель — запомнили и пробуем проще
-            continue
 
-        if resp.status_code in (429, 503):
-            last = resp.text[:200]
-            continue
+# ──────────────────────────── Остальные голоса совета (OpenRouter, Cloudflare) ────────────────────────────
 
-        last = f"{resp.status_code}: {resp.text[:200]}"
+def call_openrouter(model: str, key: str, sys_prompt: str, text: str) -> str:
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}],
+        "max_tokens": COUNCIL_MAX_TOKENS,
+    }
+    resp = requests.post(url, json=payload, headers={"Authorization": f"Bearer {key}"}, timeout=COUNCIL_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
-    return "FAIL", last
+
+def call_cloudflare(model: str, sys_prompt: str, text: str) -> str:
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{model}"
+    payload = {"messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}]}
+    resp = requests.post(url, json=payload, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, timeout=COUNCIL_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["result"]["response"]
+
+
+def gather_council_answers(sys_prompt: str, text: str) -> list[tuple[str, str]]:
+    futures = {}
+    results: list[tuple[str, str]] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        futures[pool.submit(_gemini_oneshot, [HIGH_MODEL, HIGH_MODEL_FALLBACK], sys_prompt, text, COUNCIL_MAX_TOKENS)] = "Gemini"
+
+        for i, model in enumerate(OPENROUTER_MODELS):
+            if OPENROUTER_API_KEYS:
+                key = OPENROUTER_API_KEYS[i % len(OPENROUTER_API_KEYS)]
+                futures[pool.submit(call_openrouter, model, key, sys_prompt, text)] = model
+
+        if CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID:
+            for model in CLOUDFLARE_MODELS:
+                futures[pool.submit(call_cloudflare, model, sys_prompt, text)] = model
+
+        try:
+            for fut in concurrent.futures.as_completed(futures, timeout=COUNCIL_TIMEOUT):
+                name = futures[fut]
+                try:
+                    ans = fut.result()
+                    if ans and ans.strip():
+                        results.append((name, ans.strip()[:3000]))
+                except Exception as e:
+                    print(f"Совет: {name} не ответил: {e}")
+        except concurrent.futures.TimeoutError:
+            pass
+
+    return results
+
+
+def council_answer(uid: int, text: str, sys_prompt: str, history: list) -> str:
+    candidates = gather_council_answers(sys_prompt, text)
+
+    if not candidates:
+        contents = history + [{"role": "user", "parts": [{"text": text}]}]
+        return gemini_generate(sys_prompt, contents, [HIGH_MODEL, HIGH_MODEL_FALLBACK])
+
+    if len(candidates) == 1:
+        return candidates[0][1]
+
+    drafts = "\n\n".join(f"Вариант от {name}:\n{ans}" for name, ans in candidates)
+    judge_prompt = (
+        sys_prompt
+        + "\n\nНиже черновые варианты ответа от разных моделей на вопрос пользователя. "
+        "Объедини их сильные стороны, убери ошибки и повторы, и дай один финальный, лучший, полный ответ. "
+        "Не упоминай, что это черновики и что их несколько — просто дай готовый ответ."
+    )
+    contents = history + [{"role": "user", "parts": [{"text": f"Вопрос пользователя: {text}\n\n{drafts}"}]}]
+    return gemini_generate(judge_prompt, contents, [HIGH_MODEL, HIGH_MODEL_FALLBACK])
 
 
 def ask_gemini(uid: int, text: str, image_bytes: bytes | None = None) -> str:
-    global _key_index
-
     mode = user_modes.get(uid, "normal")
     sys_prompt = SYSTEM_PROMPT_NORMAL if mode == "normal" else SYSTEM_PROMPT_ADVANCED
     custom = user_prompts.get(uid)
@@ -308,31 +474,20 @@ def ask_gemini(uid: int, text: str, image_bytes: bytes | None = None) -> str:
         sys_prompt += f"\n\nИнструкция от пользователя: {custom}"
 
     history = list(gemini_history.get(uid, []))
-    user_parts = [{"text": text}]
-    if image_bytes is not None:
-        user_parts.append({
-            "inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
-        })
-    contents = history + [{"role": "user", "parts": user_parts}]
 
-    base_models = [NORMAL_MODEL] if mode == "normal" else [HIGH_MODEL, HIGH_MODEL_FALLBACK]
+    # С фото или в обычном режиме — совет не нужен, идём напрямую в Gemini
+    if mode == "normal" or image_bytes is not None:
+        user_parts = [{"text": text}]
+        if image_bytes is not None:
+            user_parts.append({
+                "inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
+            })
+        contents = history + [{"role": "user", "parts": user_parts}]
+        models = [NORMAL_MODEL] if mode == "normal" else [HIGH_MODEL, HIGH_MODEL_FALLBACK]
+        return gemini_generate(sys_prompt, contents, models)
 
-    last_error = ""
-    for _ in range(len(GEMINI_API_KEYS)):
-        with _key_lock:
-            key = GEMINI_API_KEYS[_key_index]
-            _key_index = (_key_index + 1) % len(GEMINI_API_KEYS)
-
-        models = base_models
-        if mode == "advanced" and key in pro_incapable_keys:
-            models = [HIGH_MODEL_FALLBACK]
-
-        status, result = _try_key(key, models, sys_prompt, contents)
-        if status == "OK":
-            return result
-        last_error = result
-
-    raise RuntimeError(f"Не удалось получить ответ ни по одному ключу. {last_error[:300]}")
+    # Высокий режим, текст — совет ИИ
+    return council_answer(uid, text, sys_prompt, history)
 
 
 # ──────────────────────────── Меню ────────────────────────────
