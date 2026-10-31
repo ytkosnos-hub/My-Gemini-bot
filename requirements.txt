@@ -1,6 +1,5 @@
 pyTelegramBotAPI
 flask
 requests
-numpy
-matplotlib
 reportlab
+gunicorn
