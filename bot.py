@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Muwyto AI — Telegram-бот (Flask + webhook).
+Mewyto AI — Telegram-бот (Flask + webhook).
 
-Разделы (единственные кнопки верхнего уровня):
-  📚 Учёба — контекст (со счётчиком), свой промт, режимы Обычный/Высокий.
-             Обычный — один быстрый вызов Gemini.
-             Высокий — "совет ИИ": параллельно спрашиваем Gemini, OpenRouter
-             и Cloudflare Workers AI (какие ключи есть), а Gemini-"судья"
-             собирает из черновиков один лучший ответ.
-             Понимает фото (решает задания), сама шлёт график функции и
-             таблицу картинкой, если это уместно. Если ответ не влезает
-             в лимит Telegram — уходит PDF-файлом. Если модель обрезалась
-             на полуслове — бот сам доспрашивает "продолжи" и склеивает.
-  🏠 Быт   — пока пустой, заглушка под будущие функции.
+Никаких разделов и выбора — зашёл в чат и сразу спросил, бот сразу отвечает.
+Единственные кнопки — переключатель режима (Обычный/Высокий) и счётчик контекста.
+
+  ⚡ Обычный — один быстрый вызов Gemini (+ поиск в интернете).
+  🧠 Высокий — "совет ИИ": параллельно спрашиваем Gemini и ещё несколько
+               моделей (OpenRouter, Cloudflare Workers AI — какие ключи
+               есть), Gemini-"судья" собирает из черновиков один лучший
+               и честный ответ.
+
+Понимает текст, фото (решает задания по картинке) и голосовые сообщения
+(сама расшифровывает и отвечает). Сама шлёт график функции и таблицу
+картинкой, если это уместно. Если ответ не влезает в лимит Telegram —
+уходит PDF-файлом. Если модель обрезалась на полуслове — бот сам
+доспрашивает "продолжи" и склеивает куски.
 """
 
 import base64
@@ -81,34 +84,37 @@ OPENROUTER_API_KEYS = _collect_openrouter_keys()
 CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN")
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
 
-# Модели для обычного/высокого режима (Gemini) — высокая с автооткатом, если ключу она недоступна
 NORMAL_MODEL = os.environ.get("NORMAL_MODEL", "gemini-3.5-flash-lite")
 HIGH_MODEL = os.environ.get("HIGH_MODEL", "gemini-3.1-pro-preview")
 HIGH_MODEL_FALLBACK = os.environ.get("HIGH_MODEL_FALLBACK", "gemini-3.5-flash")
 
-# Остальные "голоса" совета для Высокого режима (бесплатные модели, на октябрь 2026)
+# "Голоса" совета для Высокого режима, вместе с Gemini — по умолчанию получается 5:
+# Gemini + 3 модели OpenRouter + 1 модель Cloudflare (какие ключи есть, те и участвуют).
 OPENROUTER_MODELS = [
     "nvidia/nemotron-3-ultra-550b-a55b:free",
     "openai/gpt-oss-120b:free",
+    "qwen/qwen3-next-80b-a3b-instruct:free",
 ]
 CLOUDFLARE_MODELS = ["@cf/meta/llama-3.3-70b-instruct-fp8-fast"]
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "mewyto-hook")
 
-# ──────────────────────────── Лимиты и экономия токенов ────────────────────────────
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "4096"))   # на финальный ответ
-COUNCIL_MAX_TOKENS = int(os.environ.get("COUNCIL_MAX_TOKENS", "1200"))  # на черновик каждого голоса совета
-COUNCIL_TIMEOUT = int(os.environ.get("COUNCIL_TIMEOUT", "45"))  # сек, сколько ждём голоса совета
-CONTINUATION_LIMIT = int(os.environ.get("CONTINUATION_LIMIT", "6"))  # сколько раз доспрашивать "продолжи"
-MAX_ANSWER_CHARS = int(os.environ.get("MAX_ANSWER_CHARS", "60000"))  # потолок длины склеенного ответа
-MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))  # сообщений (user+model) в памяти на пользователя
+# ──────────────────────────── Лимиты ────────────────────────────
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "4096"))
+COUNCIL_MAX_TOKENS = int(os.environ.get("COUNCIL_MAX_TOKENS", "1200"))
+COUNCIL_TIMEOUT = int(os.environ.get("COUNCIL_TIMEOUT", "45"))
+CONTINUATION_LIMIT = int(os.environ.get("CONTINUATION_LIMIT", "6"))
+MAX_ANSWER_CHARS = int(os.environ.get("MAX_ANSWER_CHARS", "60000"))
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
 TELEGRAM_MAX_MESSAGE = 4096
 CURRENT_DATE = datetime.now().strftime("%d.%m.%Y")
 
 SYSTEM_PROMPT_BASE = (
     f"Ты — Mewyto AI, точный помощник. Сегодня {CURRENT_DATE}. "
-    "Никогда не выдумывай цифры и факты — если не уверен, так и скажи. "
+    "У тебя есть доступ к поиску в интернете — используй его, если вопрос требует актуальных "
+    "фактов или похож на учебное задание, у которого есть готовый ответ в сети. "
+    "Никогда не выдумывай цифры и факты — если не уверен и поиск не помог, так и скажи. "
     "Не думай про лимит длины одного сообщения в Telegram и не предупреждай о нём — "
     "об этом заботится сама программа. Пиши ответ настолько длинным и полным, насколько просит пользователь "
     "(например, если просят пересказ на N страниц — пиши весь текст полностью, не сокращай и не останавливайся раньше). "
@@ -119,7 +125,8 @@ SYSTEM_PROMPT_BASE = (
     "Если по смыслу ответа нужен график функции — в самом конце ответа, отдельной строкой, напиши "
     "'ГРАФИК: <формула от x>' (в формуле только x, числа и + - * / ** sin cos tan sqrt log exp abs, "
     "больше в этой строке ничего не пиши). Пиши эту строку только если график реально нужен. "
-    "Если данные удобно показать таблицей — оформи её Markdown-таблицей (строки с | и строка из дефисов)."
+    "Если данные удобно показать таблицей — оформи её Markdown-таблицей (строки с | и строка из дефисов), "
+    "и старайся не делать ячейки слишком длинными (коротко и по сути)."
 )
 
 SYSTEM_PROMPT_NORMAL = SYSTEM_PROMPT_BASE + " Отвечай быстро и по делу, без лишних деталей."
@@ -130,12 +137,10 @@ app = Flask(__name__)
 
 _key_index = 0
 _key_lock = threading.Lock()
-pro_incapable_keys: set[str] = set()  # ключи, которым недоступна HIGH_MODEL — узнаём сами на лету
+pro_incapable_keys: set[str] = set()
 
 user_modes: dict[int, str] = {}       # "normal" | "advanced"
-user_sections: dict[int, str] = {}    # "study" | "home" | None
-user_prompts: dict[int, str] = {}     # свой промт пользователя
-gemini_history: dict[int, list] = {}  # история диалога для Gemini
+gemini_history: dict[int, list] = {}
 
 
 # ──────────────────────────── Шрифт для PDF/картинок (кириллица) ────────────────────────────
@@ -253,15 +258,32 @@ def render_graph(formula_text: str) -> bytes:
 
 
 def render_table(rows: list[list[str]]) -> bytes:
-    n_rows, n_cols = len(rows), max(len(r) for r in rows)
-    fig, ax = plt.subplots(figsize=(min(10, 1.8 * n_cols), 0.55 * n_rows + 1))
+    """Рисует таблицу картинкой, с переносом длинного текста внутри ячеек,
+    чтобы он не вылезал за границы (как раньше)."""
+    import textwrap as _tw
+
+    n_cols = max(len(r) for r in rows)
+    rows = [r + [""] * (n_cols - len(r)) for r in rows]
+
+    wrap_width = max(12, 30 - 3 * n_cols)
+    wrapped = [[_tw.fill(str(cell), wrap_width) for cell in row] for row in rows]
+
+    max_lines = max(cell.count("\n") + 1 for row in wrapped for cell in row)
+    n_rows = len(wrapped)
+
+    fig_w = min(13, 2.3 * n_cols)
+    fig_h = 0.42 * n_rows * max_lines + 1.2
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.axis("off")
-    tbl = ax.table(cellText=rows[1:], colLabels=rows[0], loc="center", cellLoc="center")
+
+    tbl = ax.table(cellText=wrapped[1:], colLabels=wrapped[0], loc="center", cellLoc="center")
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(11)
-    tbl.scale(1, 1.6)
+    tbl.set_fontsize(10)
+    tbl.auto_set_column_width(col=list(range(n_cols)))
+    tbl.scale(1, 1.6 * max_lines)
+
     buf = BytesIO()
-    plt.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    plt.savefig(buf, format="png", dpi=170, bbox_inches="tight")
     plt.close(fig)
     return buf.getvalue()
 
@@ -277,7 +299,7 @@ def to_telegram_html(text: str) -> str:
     return "".join(f"<b>{p}</b>" if i % 2 == 1 else p for i, p in enumerate(parts))
 
 
-# ──────────────────────────── Gemini (с докруткой при обрезании) ────────────────────────────
+# ──────────────────────────── Gemini (поиск в интернете + докрутка при обрезании) ────────────────────────────
 
 def remember(uid: int, user_text: str, answer: str) -> None:
     g = gemini_history.setdefault(uid, [])
@@ -286,18 +308,25 @@ def remember(uid: int, user_text: str, answer: str) -> None:
     del g[:-MAX_HISTORY]
 
 
-def _call_gemini(model: str, key: str, sys_prompt: str, contents: list, max_tokens: int | None = None):
+def _call_gemini(model: str, key: str, sys_prompt: str, contents: list, max_tokens: int | None = None, use_search: bool = True):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     payload = {
         "system_instruction": {"parts": [{"text": sys_prompt}]},
         "contents": contents,
         "generationConfig": {"maxOutputTokens": max_tokens or MAX_OUTPUT_TOKENS},
     }
-    return requests.post(url, json=payload, headers={"x-goog-api-key": key}, timeout=90)
+    if use_search:
+        payload["tools"] = [{"google_search": {}}]
+
+    resp = requests.post(url, json=payload, headers={"x-goog-api-key": key}, timeout=90)
+    if use_search and resp.status_code == 400:
+        # на некоторых моделях/ключах инструмент поиска недоступен — пробуем без него
+        payload.pop("tools", None)
+        resp = requests.post(url, json=payload, headers={"x-goog-api-key": key}, timeout=90)
+    return resp
 
 
 def _generate_with_continuation(model: str, key: str, sys_prompt: str, contents: list):
-    """Возвращает (http_код, собранный_текст, текст_ошибки). При обрезании MAX_TOKENS сама доспрашивает."""
     full_text = ""
     local_contents = list(contents)
     for _ in range(CONTINUATION_LIMIT):
@@ -331,7 +360,6 @@ def _generate_with_continuation(model: str, key: str, sys_prompt: str, contents:
 
 
 def gemini_generate(sys_prompt: str, contents: list, models: list[str]) -> str:
-    """Перебирает все ключи Gemini; для каждого — список моделей (первая из них — предпочтительная)."""
     global _key_index
     last_error = ""
     for _ in range(len(GEMINI_API_KEYS)):
@@ -363,7 +391,6 @@ def gemini_generate(sys_prompt: str, contents: list, models: list[str]) -> str:
 
 
 def _gemini_oneshot(models: list[str], sys_prompt: str, text: str, max_tokens: int) -> str:
-    """Короткий одиночный вызов Gemini — используется как один из голосов совета (без докрутки)."""
     global _key_index
     contents = [{"role": "user", "parts": [{"text": text}]}]
     for _ in range(len(GEMINI_API_KEYS)):
@@ -445,7 +472,7 @@ def gather_council_answers(sys_prompt: str, text: str) -> list[tuple[str, str]]:
     return results
 
 
-def council_answer(uid: int, text: str, sys_prompt: str, history: list) -> str:
+def council_answer(text: str, sys_prompt: str, history: list) -> str:
     candidates = gather_council_answers(sys_prompt, text)
 
     if not candidates:
@@ -466,44 +493,28 @@ def council_answer(uid: int, text: str, sys_prompt: str, history: list) -> str:
     return gemini_generate(judge_prompt, contents, [HIGH_MODEL, HIGH_MODEL_FALLBACK])
 
 
-def ask_gemini(uid: int, text: str, image_bytes: bytes | None = None) -> str:
+def ask_gemini(uid: int, text: str, image_bytes: bytes | None = None, audio_bytes: bytes | None = None) -> str:
     mode = user_modes.get(uid, "normal")
     sys_prompt = SYSTEM_PROMPT_NORMAL if mode == "normal" else SYSTEM_PROMPT_ADVANCED
-    custom = user_prompts.get(uid)
-    if custom:
-        sys_prompt += f"\n\nИнструкция от пользователя: {custom}"
-
     history = list(gemini_history.get(uid, []))
 
-    # С фото или в обычном режиме — совет не нужен, идём напрямую в Gemini
-    if mode == "normal" or image_bytes is not None:
+    if mode == "normal" or image_bytes is not None or audio_bytes is not None:
         user_parts = [{"text": text}]
         if image_bytes is not None:
-            user_parts.append({
-                "inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
-            })
+            user_parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}})
+        if audio_bytes is not None:
+            user_parts.append({"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(audio_bytes).decode()}})
         contents = history + [{"role": "user", "parts": user_parts}]
         models = [NORMAL_MODEL] if mode == "normal" else [HIGH_MODEL, HIGH_MODEL_FALLBACK]
         return gemini_generate(sys_prompt, contents, models)
 
-    # Высокий режим, текст — совет ИИ
-    return council_answer(uid, text, sys_prompt, history)
+    return council_answer(text, sys_prompt, history)
 
 
-# ──────────────────────────── Меню ────────────────────────────
+# ──────────────────────────── Меню (только режим и контекст) ────────────────────────────
 
-BTN_STUDY = "📚 Учёба"
-BTN_HOME = "🏠 Быт"
-BTN_BACK = "⬅ Назад"
-BTN_PROMPT = "📝 Промт"
 CONTEXT_PREFIX = "🔄 Контекст:"
 MODE_PREFIXES = ("🧠 Режим:", "⚡ Режим:")
-
-
-def main_menu() -> types.ReplyKeyboardMarkup:
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
-    kb.row(BTN_STUDY, BTN_HOME)
-    return kb
 
 
 def mode_label(uid: int) -> str:
@@ -517,11 +528,10 @@ def context_label(uid: int) -> str:
     return f"{CONTEXT_PREFIX} {pairs}/{cap}"
 
 
-def study_menu(uid: int) -> types.ReplyKeyboardMarkup:
+def main_menu(uid: int) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
     kb.row(mode_label(uid))
-    kb.row(BTN_PROMPT, context_label(uid))
-    kb.row(BTN_BACK)
+    kb.row(context_label(uid))
     return kb
 
 
@@ -538,10 +548,10 @@ def send_answer(chat_id: int, uid: int, raw_answer: str) -> None:
             chat_id,
             ("answer.pdf", BytesIO(pdf_bytes)),
             caption="Ответ получился длинным — сделал PDF-файл.",
-            reply_markup=study_menu(uid),
+            reply_markup=main_menu(uid),
         )
     else:
-        bot.send_message(chat_id, html_text, parse_mode="HTML", reply_markup=study_menu(uid))
+        bot.send_message(chat_id, html_text, parse_mode="HTML", reply_markup=main_menu(uid))
 
     if table_rows:
         try:
@@ -558,34 +568,14 @@ def send_answer(chat_id: int, uid: int, raw_answer: str) -> None:
 
 # ──────────────────────────── Хендлеры ────────────────────────────
 
-@bot.message_handler(commands=["start", "cancel"])
+@bot.message_handler(commands=["start"])
 def cmd_start(m: types.Message):
     uid = m.from_user.id
-    user_sections[uid] = None
     bot.send_message(
         m.chat.id,
-        f"Привет! Я Mewyto AI.\nСегодня {CURRENT_DATE}.\n\nВыбери раздел:",
-        reply_markup=main_menu(),
+        f"Привет! Я Mewyto AI.\nСегодня {CURRENT_DATE}.\n\nПросто пиши вопрос, кидай фото задания или голосовое — отвечу.",
+        reply_markup=main_menu(uid),
     )
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_STUDY)
-def open_study(m: types.Message):
-    uid = m.from_user.id
-    user_sections[uid] = "study"
-    bot.send_message(m.chat.id, "Раздел «Учёба». Пиши вопрос или кидай фото задания.", reply_markup=study_menu(uid))
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_HOME)
-def open_home(m: types.Message):
-    user_sections[m.from_user.id] = "home"
-    bot.send_message(m.chat.id, "Раздел «Быт» пока пустой — скоро добавим сюда функции.", reply_markup=main_menu())
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_BACK)
-def go_back(m: types.Message):
-    user_sections[m.from_user.id] = None
-    bot.send_message(m.chat.id, "Главное меню. Выбери раздел:", reply_markup=main_menu())
 
 
 @bot.message_handler(func=lambda m: bool(m.text) and m.text.startswith(MODE_PREFIXES))
@@ -594,43 +584,18 @@ def toggle_mode(m: types.Message):
     cur = user_modes.get(uid, "normal")
     user_modes[uid] = "advanced" if cur == "normal" else "normal"
     readable = "Высокий" if user_modes[uid] == "advanced" else "Обычный"
-    bot.send_message(m.chat.id, f"✅ Режим: {readable}", reply_markup=study_menu(uid))
+    bot.send_message(m.chat.id, f"✅ Режим: {readable}", reply_markup=main_menu(uid))
 
 
 @bot.message_handler(func=lambda m: bool(m.text) and m.text.startswith(CONTEXT_PREFIX))
 def clear_context(m: types.Message):
     gemini_history.pop(m.from_user.id, None)
-    bot.send_message(m.chat.id, "🔄 Контекст диалога очищен.", reply_markup=study_menu(m.from_user.id))
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_PROMPT)
-def ask_prompt(m: types.Message):
-    msg = bot.send_message(
-        m.chat.id,
-        "Напиши свою инструкцию для бота (как ему отвечать на твои вопросы).\n"
-        "Чтобы убрать текущую — пришли «сброс».",
-    )
-    bot.register_next_step_handler(msg, _save_prompt)
-
-
-def _save_prompt(m: types.Message):
-    uid = m.from_user.id
-    text = (m.text or "").strip()
-    if text.lower() in ("сброс", "очистить"):
-        user_prompts.pop(uid, None)
-        bot.send_message(m.chat.id, "Промт сброшен.", reply_markup=study_menu(uid))
-    else:
-        user_prompts[uid] = text[:1000]
-        bot.send_message(m.chat.id, "✅ Промт сохранён.", reply_markup=study_menu(uid))
+    bot.send_message(m.chat.id, "🔄 Контекст диалога очищен.", reply_markup=main_menu(m.from_user.id))
 
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(m: types.Message):
     uid = m.from_user.id
-    if user_sections.get(uid) != "study":
-        bot.send_message(m.chat.id, "Сначала выбери раздел «📚 Учёба» в меню.", reply_markup=main_menu())
-        return
-
     caption = m.caption or "Реши задание на фото по шагам. Если это не задание — опиши, что на фото, и ответь по сути."
     thinking = bot.send_message(m.chat.id, "💭 Смотрю фото...")
 
@@ -654,13 +619,34 @@ def handle_photo(m: types.Message):
     send_answer(m.chat.id, uid, answer)
 
 
+@bot.message_handler(content_types=["voice"])
+def handle_voice(m: types.Message):
+    uid = m.from_user.id
+    thinking = bot.send_message(m.chat.id, "💭 Слушаю голосовое...")
+
+    try:
+        file_info = bot.get_file(m.voice.file_id)
+        raw = bot.download_file(file_info.file_path)
+        answer = ask_gemini(uid, "Расшифруй это голосовое сообщение и ответь на вопрос или выполни просьбу из него.", audio_bytes=raw)
+        remember(uid, "[Голосовое сообщение]", answer)
+    except Exception as e:
+        try:
+            bot.edit_message_text(f"Ошибка при разборе голосового: {e}"[:300], m.chat.id, thinking.message_id)
+        except Exception:
+            pass
+        return
+
+    try:
+        bot.delete_message(m.chat.id, thinking.message_id)
+    except Exception:
+        pass
+
+    send_answer(m.chat.id, uid, answer)
+
+
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_text(m: types.Message):
     uid = m.from_user.id
-    if user_sections.get(uid) != "study":
-        bot.send_message(m.chat.id, "Сначала выбери раздел «📚 Учёба» в меню.", reply_markup=main_menu())
-        return
-
     thinking = bot.send_message(m.chat.id, "💭 Думаю...")
 
     try:
